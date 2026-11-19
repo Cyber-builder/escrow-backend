@@ -107,6 +107,11 @@ pub(crate) fn pause_until(
     None
 }
 
+/// Mutating requests: the ones GitHub asks to be spaced out.
+fn is_write(m: &reqwest::Method) -> bool {
+    *m == reqwest::Method::POST || *m == reqwest::Method::PATCH || *m == reqwest::Method::PUT || *m == reqwest::Method::DELETE
+}
+
 /// How long a write must wait so that writes are spaced by `WRITE_SPACING`.
 pub(crate) fn write_wait(last: Option<Instant>, now: Instant) -> Duration {
     match last {
@@ -213,13 +218,13 @@ impl GithubClient {
             {
                 return Err(GithubError::RateLimited { retry_at: reset, what: what.into() });
             }
-            let writes = matches!(*method, reqwest::Method::POST | reqwest::Method::PATCH | reqwest::Method::PUT | reqwest::Method::DELETE);
+            let writes = is_write(method);
             if writes { write_wait(t.last_write, Instant::now()) } else { Duration::ZERO }
         };
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
         }
-        if matches!(*method, reqwest::Method::POST | reqwest::Method::PATCH | reqwest::Method::PUT | reqwest::Method::DELETE) {
+        if is_write(method) {
             self.throttles.lock().await.entry(installation).or_default().last_write = Some(Instant::now());
         }
         Ok(())
