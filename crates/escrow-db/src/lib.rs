@@ -14,6 +14,7 @@ pub mod jobs;
 pub mod models;
 pub mod payouts;
 pub mod prs;
+pub mod rate_limits;
 pub mod reviews;
 pub mod serde_helpers;
 pub mod sessions;
