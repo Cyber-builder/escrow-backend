@@ -43,7 +43,7 @@ SELECT id, bounty_id, status, tx_hash, attempts, last_error FROM payouts WHERE s
 
 ### A contributor was never paid after a merge
 
-Check the payout row for that bounty: `PENDING_WALLET` (they have not linked a wallet; the bot already asked on the PR; once they link it, it continues by itself), `AWAITING_MAINTAINER` (the maintainer funded without relayer permission and must sign: the bounty page has the button), `QUEUED`/`SUBMITTED` (in flight; check the relayer log), `FAILED` (above). If there is **no** payout row, the merge webhook was not processed: look at GitHub's "Recent deliveries" for the App, redeliver, and check `webhook_deliveries` and `jobs`.
+Check the payout row for that bounty: `PENDING_WALLET` (they have not linked a wallet. The bot comments on the merged PR at 1 h, 24 h and 72 h after the merge, mentioning the author, and posts a confirmation once a wallet is linked. Each reminder is recorded in `payout_reminders`, so restarts do not repeat one. Reminders stop when the bounty leaves Open or the refund window opens. A bot or deleted author is skipped and logged as `wallet_reminder.skipped` in the audit log: follow up by hand. To silence reminders for one repository, insert `repo_settings(repo_id, wallet_reminders=false)`; there is no UI for it yet), `AWAITING_MAINTAINER` (the maintainer funded without relayer permission and must sign: the bounty page has the button), `QUEUED`/`SUBMITTED` (in flight; check the relayer log), `FAILED` (above). If there is **no** payout row, the merge webhook was not processed: look at GitHub's "Recent deliveries" for the App, redeliver, and check `webhook_deliveries` and `jobs`.
 
 ### The indexer is behind
 
