@@ -42,4 +42,8 @@ pub trait ReleaseSigner: Send + Sync {
     async fn submit_release(&self, bounty_id: u64, winner: &str) -> Result<String, ChainError>;
     async fn wait_for_tx(&self, hash: &str) -> Result<TxOutcome, ChainError>;
     async fn balance_xlm(&self) -> Result<f64, ChainError>;
+    /// How many releases may be in flight at once. One unless the signer has channel accounts.
+    fn max_parallel(&self) -> usize {
+        1
+    }
 }

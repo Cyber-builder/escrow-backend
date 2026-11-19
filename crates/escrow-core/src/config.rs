@@ -62,6 +62,8 @@ pub struct Config {
     pub ai_max_per_repo_per_day: u32,
     pub explorer_tx_template: String,
     pub relayer_secret: Option<String>,
+    /// extra channel accounts that source relayer releases (empty = the relayer is its own source)
+    pub relayer_channel_secrets: Vec<String>,
     pub relayer_min_xlm_alert: f64,
     pub alert_webhook_url: Option<String>,
     pub token_usdc: String,
@@ -231,6 +233,17 @@ impl Config {
             r.errors.push("RELAYER_SECRET: must not be used on mainnet; use a KMS-backed signer".into());
         }
 
+        let relayer_channel_secrets: Vec<String> = r
+            .optional("RELAYER_CHANNEL_SECRETS")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default();
+        if relayer_channel_secrets.iter().any(|s| !strkey_s.is_match(s)) {
+            r.errors.push("RELAYER_CHANNEL_SECRETS: every entry must be a Stellar secret key (S…, 56 characters)".into());
+        }
+        if !relayer_channel_secrets.is_empty() && (relayer_secret.is_none() || network == Network::Mainnet) {
+            r.errors.push("RELAYER_CHANNEL_SECRETS: needs RELAYER_SECRET, and is not supported on mainnet yet".into());
+        }
+
         let admin_github_ids = r
             .matches("ADMIN_GITHUB_IDS", &digits_list, "comma-separated numeric GitHub ids")
             .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
@@ -286,6 +299,7 @@ impl Config {
             ai_max_per_repo_per_day: r.number("AI_MAX_REVIEWS_PER_REPO_PER_DAY", 50u32),
             explorer_tx_template: r.string("EXPLORER_TX_URL_TEMPLATE", default_explorer),
             relayer_secret,
+            relayer_channel_secrets,
             relayer_min_xlm_alert: r.number("RELAYER_MIN_XLM_ALERT", 50.0f64),
             alert_webhook_url: r.optional("ALERT_WEBHOOK_URL"),
             token_usdc: r.string("TOKEN_USDC_CONTRACT_ID", ""),

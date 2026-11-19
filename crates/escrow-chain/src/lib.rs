@@ -6,6 +6,7 @@
 //! transactions; the one key it can hold (the relayer's) can do exactly one thing, `release`,
 //! and only for bounties whose maintainer opted in.
 
+pub mod channels;
 pub mod client;
 pub mod error;
 pub mod events;
@@ -18,6 +19,7 @@ pub mod scval;
 pub mod tx;
 pub mod types;
 
+pub use channels::ChannelPool;
 pub use client::{ChainSettings, SorobanChain};
 pub use error::ChainError;
 pub use events::{ChainEvent, RawEvent, decode_event};
