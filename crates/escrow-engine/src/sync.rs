@@ -10,7 +10,7 @@ use escrow_core::{
     criteria::parse_criteria,
     fees,
 };
-use escrow_db::{Db, audit, bounties, github as gh_repo, payouts, prs};
+use escrow_db::{Db, audit, bounties, github as gh_repo, payout_reminders, payouts, prs};
 use escrow_github::GithubApi;
 use escrow_payouts::Notifier;
 use std::sync::Arc;
@@ -228,6 +228,86 @@ pub async fn send_refund_reminders(
     Ok(sent)
 }
 
+/// Wallet reminder stages after a PR merge while its payout waits for a wallet: name and hours after the merge.
+/// One comment per stage, never more than three.
+const WALLET_STAGES: [(&str, i64); 3] = [("h1", 1), ("h24", 24), ("h72", 72)];
+
+/// The next stage due for a payout `age` old that already has `sent` stages. Stages go out in order.
+pub fn due_wallet_stage(age: Duration, sent: &[String]) -> Option<&'static str> {
+    WALLET_STAGES.iter().find(|(s, h)| age >= Duration::hours(*h) && !sent.iter().any(|x| x == s)).map(|(s, _)| *s)
+}
+
+/// The comment asking a contributor to link a wallet. Only the login and the numbers come from outside.
+pub fn wallet_reminder_body(login: &str, amount: &str, symbol: &str, bounty_id: i64, web_url: &str, window_opens: DateTime<Utc>) -> String {
+    format!(
+        "@{login} your merged PR is waiting for a wallet. **{amount} {symbol}** is held for you. Link a wallet at {web_url}/me to receive it. If no wallet is linked before {}, the maintainer may reclaim the funds (bounty #{bounty_id}).",
+        window_opens.format("%Y-%m-%d %H:%M UTC")
+    )
+}
+
+/// The one-time confirmation after a contributor who was reminded has linked a wallet.
+pub fn wallet_linked_body(login: &str) -> String {
+    format!("@{login} your wallet is linked. Your payout is queued and will be paid shortly.")
+}
+
+/// Wallet reminders for merged PRs whose payout is still waiting for a wallet. Runs on the hourly tick.
+/// Each stage is recorded after its comment succeeds, so a restart never repeats one. Stops when the bounty is no
+/// longer open or its refund window has opened. A bot or a deleted account is skipped and logged to the audit trail.
+pub async fn send_wallet_reminders(d: &SyncDeps, grace: Duration, now: DateTime<Utc>) -> Result<Vec<String>, EngineError> {
+    let mut sent = vec![];
+    for p in payout_reminders::waiting(&d.db.pool).await? {
+        let Some((b, repo)) = bounties::with_repo(&d.db.pool, p.bounty_id).await? else {
+            continue;
+        };
+        if !b.status().is_active() || now >= b.deadline + grace {
+            continue;
+        }
+        if !payout_reminders::wallet_reminders_enabled(&d.db.pool, repo.id).await? {
+            continue;
+        }
+        let done = payout_reminders::stages_sent(&d.db.pool, &p.payout_id).await?;
+        let Some(stage) = due_wallet_stage(now - p.created_at, &done) else {
+            continue;
+        };
+        let Some(pr) = prs::for_bounty(&d.db.pool, b.id).await?.into_iter().find(|l| l.number == p.pr_number) else {
+            continue;
+        };
+        let target = format!("payout:{}", p.payout_id);
+        let outcome = if pr.author_login.ends_with("[bot]") {
+            "skipped"
+        } else {
+            let net = fees::net(b.amount_i128(), b.fee_bps as u32).map_err(|_| EngineError::Other("fee overflow".into()))?;
+            let body = wallet_reminder_body(&pr.author_login, &display(net, 2), &d.tokens.symbol_for(&b.token), b.id, &d.web_url, b.deadline + grace);
+            match d.gh.post_comment(repo.installation_id, &repo.full_name, p.pr_number, &body).await {
+                Ok(_) => "sent",
+                // the account is gone or the PR is unreachable: nothing to retry, so record it and tell the maintainers
+                Err(e) if e.status() == Some(404) => "skipped",
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let recorded = if outcome == "sent" { stage } else { "skipped" };
+        payout_reminders::record(&d.db.pool, &p.payout_id, recorded).await?;
+        audit::log(&d.db.pool, "system", &format!("wallet_reminder.{outcome}"), &target, &serde_json::json!({ "stage": stage })).await?;
+        if outcome == "sent" {
+            sent.push(format!("{stage}:{}", p.payout_id));
+        } else {
+            tracing::warn!(payout = %p.payout_id, "wallet reminder skipped; maintainers should follow up");
+        }
+    }
+    for p in payout_reminders::linked_after_reminder(&d.db.pool).await? {
+        let Some((b, repo)) = bounties::with_repo(&d.db.pool, p.bounty_id).await? else {
+            continue;
+        };
+        let Some(pr) = prs::for_bounty(&d.db.pool, b.id).await?.into_iter().find(|l| l.number == p.pr_number) else {
+            continue;
+        };
+        d.gh.post_comment(repo.installation_id, &repo.full_name, p.pr_number, &wallet_linked_body(&pr.author_login)).await?;
+        payout_reminders::record(&d.db.pool, &p.payout_id, "linked").await?;
+        sent.push(format!("linked:{}", p.payout_id));
+    }
+    Ok(sent)
+}
+
 /// Brings installations and their repositories in line with GitHub (covers webhooks missed while we were down).
 pub async fn sync_installations(db: &Db, gh: &dyn GithubApi) -> Result<(usize, usize), EngineError> {
     let (mut installs, mut repos) = (0, 0);
@@ -248,6 +328,26 @@ pub async fn sync_installations(db: &Db, gh: &dyn GithubApi) -> Result<(usize, u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallet_stages_go_out_in_order_and_stop_at_three() {
+        let h = Duration::hours;
+        assert_eq!(due_wallet_stage(h(0), &[]), None);
+        assert_eq!(due_wallet_stage(h(1), &[]), Some("h1"));
+        assert_eq!(due_wallet_stage(h(30), &["h1".into()]), Some("h24"));
+        assert_eq!(due_wallet_stage(h(200), &["h1".into(), "h24".into()]), Some("h72"));
+        assert_eq!(due_wallet_stage(h(200), &["h1".into(), "h24".into(), "h72".into()]), None);
+    }
+
+    #[test]
+    fn wallet_reminder_text_is_stable() {
+        let when = DateTime::parse_from_rfc3339("2026-11-20T12:00:00Z").unwrap().with_timezone(&Utc);
+        assert_eq!(
+            wallet_reminder_body("octocat", "4.85", "USDC", 7, "https://app.example", when),
+            "@octocat your merged PR is waiting for a wallet. **4.85 USDC** is held for you. Link a wallet at https://app.example/me to receive it. If no wallet is linked before 2026-11-20 12:00 UTC, the maintainer may reclaim the funds (bounty #7)."
+        );
+    }
+
 
     #[test]
     fn symbols_fall_back_to_a_short_id() {

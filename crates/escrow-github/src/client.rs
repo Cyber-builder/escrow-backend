@@ -13,13 +13,25 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use regex::Regex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::LazyLock, time::Duration};
+use std::{collections::HashMap, sync::LazyLock, time::{Duration, Instant}};
 use tokio::sync::Mutex;
 
 static REPO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$").unwrap());
 static LOGIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9-]+(\[bot\])?$").unwrap());
 static SHA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?i)[0-9a-f]{7,64}$").unwrap());
+/// Stop calling an installation when fewer than this many primary-limit calls remain before its reset.
+const SAFETY_MARGIN: i64 = 10;
+/// GitHub asks for about one second between mutating requests.
+const WRITE_SPACING: Duration = Duration::from_secs(1);
+/// Pause for a 429 or a limited 403 that names no wait time.
+const DEFAULT_PAUSE_SECS: i64 = 60;
+/// Bound on cached ETag responses, so the cache cannot grow without limit.
+const ETAG_CACHE_MAX: usize = 1024;
+
 static LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^bounty: [A-Za-z0-9_ .]{1,40}$").unwrap());
+static FILE_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_./-]{1,300}$").unwrap());
+/// Files bigger than this are not read for review context.
+const MAX_CONTEXT_FILE_BYTES: u64 = 200_000;
 
 fn repo_ok(r: &str) -> Result<&str, GithubError> {
     let dots = r.split('/').any(|s| s == "." || s == "..");
@@ -61,12 +73,65 @@ struct CachedToken {
     expires_at: DateTime<Utc>,
 }
 
+/// What we know about one installation's rate limits. Each installation has its own, so one throttled
+/// installation never stops another.
+#[derive(Default)]
+struct Throttle {
+    /// Do not call this installation again before this time.
+    paused_until: Option<DateTime<Utc>>,
+    remaining: Option<i64>,
+    reset_at: Option<DateTime<Utc>>,
+    last_write: Option<Instant>,
+}
+
+/// Given a response's status and limit headers, the time before which the installation must not be called again.
+/// `None` means the response is not a rate limit (a 403 for permissions, say) and is handled as a normal status.
+pub(crate) fn pause_until(
+    status: u16,
+    retry_after: Option<i64>,
+    remaining: Option<i64>,
+    reset: Option<i64>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if status != 403 && status != 429 {
+        return None;
+    }
+    // secondary limits name the wait exactly
+    if let Some(s) = retry_after {
+        return Some(now + chrono::Duration::seconds(s.max(1)));
+    }
+    // primary limit: the window resets at the reset time
+    if remaining == Some(0) {
+        return Some(reset.and_then(|r| DateTime::from_timestamp(r, 0)).unwrap_or(now + chrono::Duration::seconds(DEFAULT_PAUSE_SECS)));
+    }
+    if status == 429 {
+        return Some(now + chrono::Duration::seconds(DEFAULT_PAUSE_SECS));
+    }
+    None
+}
+
+/// Mutating requests: the ones GitHub asks to be spaced out.
+fn is_write(m: &reqwest::Method) -> bool {
+    *m == reqwest::Method::POST || *m == reqwest::Method::PATCH || *m == reqwest::Method::PUT || *m == reqwest::Method::DELETE
+}
+
+/// How long a write must wait so that writes are spaced by `WRITE_SPACING`.
+pub(crate) fn write_wait(last: Option<Instant>, now: Instant) -> Duration {
+    match last {
+        Some(t) => WRITE_SPACING.saturating_sub(now.duration_since(t)),
+        None => Duration::ZERO,
+    }
+}
+
 pub struct GithubClient {
     http: reqwest::Client,
     api: String,
     app_id: String,
     key: EncodingKey,
     tokens: Mutex<HashMap<i64, CachedToken>>,
+    throttles: Mutex<HashMap<i64, Throttle>>,
+    /// installation + path -> (ETag, body) for conditional GETs
+    etags: Mutex<HashMap<String, (String, Vec<u8>)>>,
     now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
 }
 
@@ -82,6 +147,8 @@ impl GithubClient {
             app_id: cfg.app_id,
             key,
             tokens: Mutex::default(),
+            throttles: Mutex::default(),
+            etags: Mutex::default(),
             now: Box::new(Utc::now),
         })
     }
@@ -136,6 +203,54 @@ impl GithubClient {
         h
     }
 
+    /// Waits for this installation's limits to allow a call. Fails fast with `RateLimited` when it is paused or
+    /// nearly out of primary quota; spaces mutating requests by `WRITE_SPACING`.
+    async fn gate(&self, installation: i64, method: &reqwest::Method, what: &str) -> Result<(), GithubError> {
+        let now = (self.now)();
+        let wait = {
+            let mut all = self.throttles.lock().await;
+            let t = all.entry(installation).or_default();
+            if let Some(until) = t.paused_until
+                && until > now
+            {
+                return Err(GithubError::RateLimited { retry_at: until, what: what.into() });
+            }
+            if let (Some(r), Some(reset)) = (t.remaining, t.reset_at)
+                && r < SAFETY_MARGIN
+                && reset > now
+            {
+                return Err(GithubError::RateLimited { retry_at: reset, what: what.into() });
+            }
+            let writes = is_write(method);
+            if writes { write_wait(t.last_write, Instant::now()) } else { Duration::ZERO }
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        if is_write(method) {
+            self.throttles.lock().await.entry(installation).or_default().last_write = Some(Instant::now());
+        }
+        Ok(())
+    }
+
+    /// Reads the limit headers of a response and remembers them for this installation.
+    async fn remember(&self, installation: i64, resp: &reqwest::Response) -> Option<DateTime<Utc>> {
+        let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok());
+        let now = (self.now)();
+        let (retry_after, remaining, reset) = (header("retry-after"), header("x-ratelimit-remaining"), header("x-ratelimit-reset"));
+        let mut all = self.throttles.lock().await;
+        let t = all.entry(installation).or_default();
+        if let Some(r) = remaining {
+            t.remaining = Some(r);
+            t.reset_at = reset.and_then(|s| DateTime::from_timestamp(s, 0));
+        }
+        let until = pause_until(resp.status().as_u16(), retry_after, remaining, reset, now);
+        if let Some(u) = until {
+            t.paused_until = Some(u.max(t.paused_until.unwrap_or(u)));
+        }
+        until
+    }
+
     /// One authenticated call. A 401 means the cached token was revoked or expired early: fetch a new one, once.
     async fn call(
         &self,
@@ -144,15 +259,34 @@ impl GithubClient {
         path: &str,
         body: Option<&Value>,
     ) -> Result<reqwest::Response, GithubError> {
+        self.call_with(installation, method, path, body, None).await
+    }
+
+    async fn call_with(
+        &self,
+        installation: i64,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+        if_none_match: Option<&str>,
+    ) -> Result<reqwest::Response, GithubError> {
+        let what = format!("{method} {}", path.split('?').next().unwrap_or(path));
         for attempt in 0..2 {
+            self.gate(installation, &method, &what).await?;
             let token = self.installation_token(installation, attempt == 1).await?;
             let mut req = self.http.request(method.clone(), format!("{}{path}", self.api)).headers(self.base_headers()).bearer_auth(token);
+            if let Some(tag) = if_none_match {
+                req = req.header(reqwest::header::IF_NONE_MATCH, tag);
+            }
             if let Some(b) = body {
                 req = req.json(b);
             }
             let resp = req.send().await?;
             if resp.status().as_u16() == 401 && attempt == 0 {
                 continue;
+            }
+            if let Some(retry_at) = self.remember(installation, &resp).await {
+                return Err(GithubError::RateLimited { retry_at, what });
             }
             return Ok(resp);
         }
@@ -167,9 +301,31 @@ impl GithubClient {
         body: Option<&Value>,
     ) -> Result<T, GithubError> {
         let what = format!("{method} {}", path.split('?').next().unwrap_or(path));
-        let r = self.call(installation, method, path, body).await?;
+        let cacheable = method == reqwest::Method::GET;
+        let key = format!("{installation}:{path}");
+        let cached = if cacheable { self.etags.lock().await.get(&key).cloned() } else { None };
+        let r = self.call_with(installation, method, path, body, cached.as_ref().map(|(tag, _)| tag.as_str())).await?;
+        // 304: the cached body is still current, and GitHub does not count it against the quota
+        if r.status().as_u16() == 304
+            && let Some((_, bytes)) = cached
+        {
+            return serde_json::from_slice(&bytes).map_err(|e| GithubError::Decode(e.to_string()));
+        }
         if !r.status().is_success() {
             return Err(GithubError::Status { status: r.status().as_u16(), what });
+        }
+        let etag = r.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        if cacheable
+            && let Some(tag) = etag
+        {
+            let bytes = r.bytes().await?.to_vec();
+            let value = serde_json::from_slice(&bytes).map_err(|e| GithubError::Decode(e.to_string()))?;
+            let mut cache = self.etags.lock().await;
+            if cache.len() >= ETAG_CACHE_MAX {
+                cache.clear();
+            }
+            cache.insert(key, (tag, bytes));
+            return Ok(value);
         }
         r.json().await.map_err(|e| GithubError::Decode(e.to_string()))
     }
@@ -322,6 +478,40 @@ impl GithubApi for GithubClient {
         Ok(String::from_utf8_lossy(&bytes).chars().take(max_chars).collect())
     }
 
+    async fn get_file_at(&self, installation: i64, repo: &str, git_ref: Option<&str>, path: &str) -> Result<Option<String>, GithubError> {
+        if !FILE_PATH.is_match(path) || path.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
+            return Err(GithubError::Invalid("invalid file path".into()));
+        }
+        let mut url = format!("/repos/{}/contents/{path}", repo_ok(repo)?);
+        if let Some(r) = git_ref {
+            if !SHA.is_match(r) {
+                return Err(GithubError::Invalid("invalid ref".into()));
+            }
+            url.push_str(&format!("?ref={r}"));
+        }
+        let r = self.call(installation, reqwest::Method::GET, &url, None).await?;
+        if r.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !r.status().is_success() {
+            return Err(GithubError::Status { status: r.status().as_u16(), what: "file read".into() });
+        }
+        #[derive(Deserialize)]
+        struct F {
+            #[serde(rename = "type")]
+            kind: Option<String>,
+            encoding: Option<String>,
+            size: Option<u64>,
+            content: Option<String>,
+        }
+        let f: F = r.json().await.map_err(|e| GithubError::Decode(e.to_string()))?;
+        if f.kind.as_deref() != Some("file") || f.encoding.as_deref() != Some("base64") || f.size.unwrap_or(0) > MAX_CONTEXT_FILE_BYTES {
+            return Ok(None);
+        }
+        let bytes = STANDARD.decode(f.content.unwrap_or_default().replace('\n', "")).unwrap_or_default();
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
     async fn list_installations(&self) -> Result<Vec<InstallationInfo>, GithubError> {
         let r = self
             .http
@@ -342,5 +532,45 @@ impl GithubApi for GithubClient {
             repositories: Vec<RepoInfo>,
         }
         Ok(self.json::<R>(installation, reqwest::Method::GET, "/installation/repositories?per_page=100", None).await?.repositories)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(s: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(s, 0).unwrap()
+    }
+
+    #[test]
+    fn secondary_limit_honours_retry_after_exactly() {
+        assert_eq!(pause_until(403, Some(120), None, None, at(1000)), Some(at(1120)));
+        assert_eq!(pause_until(429, Some(0), None, None, at(1000)), Some(at(1001)), "never less than a second");
+    }
+
+    #[test]
+    fn primary_exhaustion_waits_for_the_reset() {
+        assert_eq!(pause_until(403, None, Some(0), Some(1500), at(1000)), Some(at(1500)));
+    }
+
+    #[test]
+    fn too_many_requests_without_headers_pauses_a_minute() {
+        assert_eq!(pause_until(429, None, None, None, at(1000)), Some(at(1060)));
+    }
+
+    #[test]
+    fn a_plain_permission_403_is_not_a_rate_limit() {
+        assert_eq!(pause_until(403, None, Some(4000), Some(1500), at(1000)), None);
+        assert_eq!(pause_until(404, Some(60), None, None, at(1000)), None);
+    }
+
+    #[test]
+    fn writes_are_spaced_by_a_second() {
+        let t0 = Instant::now();
+        assert_eq!(write_wait(None, t0), Duration::ZERO);
+        assert_eq!(write_wait(Some(t0), t0), WRITE_SPACING);
+        assert_eq!(write_wait(Some(t0), t0 + WRITE_SPACING), Duration::ZERO);
     }
 }

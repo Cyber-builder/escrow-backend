@@ -60,8 +60,12 @@ pub struct Config {
     pub ai_model: String,
     pub ai_max_per_pr_per_day: u32,
     pub ai_max_per_repo_per_day: u32,
+    /// `basic` lets the reviewer read a few repository files beyond the diff
+    pub ai_repo_context: bool,
     pub explorer_tx_template: String,
     pub relayer_secret: Option<String>,
+    /// extra channel accounts that source relayer releases (empty = the relayer is its own source)
+    pub relayer_channel_secrets: Vec<String>,
     pub relayer_min_xlm_alert: f64,
     pub alert_webhook_url: Option<String>,
     pub token_usdc: String,
@@ -231,6 +235,27 @@ impl Config {
             r.errors.push("RELAYER_SECRET: must not be used on mainnet; use a KMS-backed signer".into());
         }
 
+        let relayer_channel_secrets: Vec<String> = r
+            .optional("RELAYER_CHANNEL_SECRETS")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default();
+        if relayer_channel_secrets.iter().any(|s| !strkey_s.is_match(s)) {
+            r.errors.push("RELAYER_CHANNEL_SECRETS: every entry must be a Stellar secret key (S…, 56 characters)".into());
+        }
+        if !relayer_channel_secrets.is_empty() && (relayer_secret.is_none() || network == Network::Mainnet) {
+            r.errors.push("RELAYER_CHANNEL_SECRETS: needs RELAYER_SECRET, and is not supported on mainnet yet".into());
+        }
+
+        let ai_repo_context_mode = r.string("AI_REPO_CONTEXT", "off");
+        let ai_repo_context = match ai_repo_context_mode.as_str() {
+            "basic" => true,
+            "off" => false,
+            _ => {
+                r.errors.push("AI_REPO_CONTEXT: must be `off` or `basic`".into());
+                false
+            }
+        };
+
         let admin_github_ids = r
             .matches("ADMIN_GITHUB_IDS", &digits_list, "comma-separated numeric GitHub ids")
             .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
@@ -284,8 +309,10 @@ impl Config {
             ai_model: r.string("AI_MODEL", "claude-sonnet-5-5"),
             ai_max_per_pr_per_day: r.number("AI_MAX_REVIEWS_PER_PR_PER_DAY", 5u32),
             ai_max_per_repo_per_day: r.number("AI_MAX_REVIEWS_PER_REPO_PER_DAY", 50u32),
+            ai_repo_context,
             explorer_tx_template: r.string("EXPLORER_TX_URL_TEMPLATE", default_explorer),
             relayer_secret,
+            relayer_channel_secrets,
             relayer_min_xlm_alert: r.number("RELAYER_MIN_XLM_ALERT", 50.0f64),
             alert_webhook_url: r.optional("ALERT_WEBHOOK_URL"),
             token_usdc: r.string("TOKEN_USDC_CONTRACT_ID", ""),

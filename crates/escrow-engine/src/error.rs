@@ -20,6 +20,14 @@ pub enum EngineError {
 }
 
 impl EngineError {
+    /// When the failure was a GitHub rate limit, the time GitHub will accept calls again.
+    pub fn retry_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Self::Github(e) => e.retry_at(),
+            _ => None,
+        }
+    }
+
     /// Worth retrying later. A bad payload or a permission failure will fail the same way next time.
     pub fn is_transient(&self) -> bool {
         match self {

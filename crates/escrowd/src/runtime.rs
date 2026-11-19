@@ -100,8 +100,15 @@ pub async fn connect(cfg: Config, migrate: bool) -> Result<Runtime> {
         Some(g) => (Arc::new(GithubClient::new(GithubClientConfig::new(&g.app_id, &g.private_key)).context("GitHub App key")?), true),
         None => (Arc::new(NoGithub), false),
     };
-    let relayer =
-        cfg.relayer_secret.as_deref().map(|s| Relayer::new(chain.clone(), s).map(Arc::new)).transpose().context("RELAYER_SECRET")?;
+    let relayer = match cfg.relayer_secret.as_deref() {
+        Some(s) => Some(Arc::new(
+            Relayer::new(chain.clone(), s)
+                .context("RELAYER_SECRET")?
+                .with_channel_secrets(&cfg.relayer_channel_secrets)
+                .context("RELAYER_CHANNEL_SECRETS")?,
+        )),
+        None => None,
+    };
     let ai_enabled = github_configured && cfg.anthropic_api_key.is_some();
     Ok(Runtime { cfg, db, chain, gh, github_configured, relayer, ai_enabled })
 }
@@ -181,6 +188,7 @@ impl Runtime {
             model_name: self.cfg.ai_model.clone(),
             max_per_pr_per_day: i64::from(self.cfg.ai_max_per_pr_per_day),
             max_per_repo_per_day: i64::from(self.cfg.ai_max_per_repo_per_day),
+            repo_context: self.cfg.ai_repo_context,
         })))
     }
 

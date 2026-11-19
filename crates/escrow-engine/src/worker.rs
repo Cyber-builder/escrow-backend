@@ -116,7 +116,11 @@ async fn run_one(w: &WorkerDeps, job: &Job, worker: usize) {
             }
         }
         Err(e) if e.is_transient() => {
-            let wait = retry_backoff_secs(job.attempts);
+            let mut wait = retry_backoff_secs(job.attempts);
+            // a rate limit names the time GitHub will accept calls again: never retry before it
+            if let Some(at) = e.retry_at() {
+                wait = wait.max((at - Utc::now()).num_seconds().max(1));
+            }
             tracing::warn!(worker, job = job.id, kind = %job.kind, attempt = job.attempts, error = %e, retry_in_secs = wait, "job failed, will retry");
             match jobs::fail(pool, job.id, &e.to_string(), wait).await {
                 Ok(true) => tracing::error!(job = job.id, kind = %job.kind, "job gave up after its last attempt"),

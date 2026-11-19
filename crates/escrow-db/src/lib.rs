@@ -12,6 +12,7 @@ pub mod github;
 pub mod intents;
 pub mod jobs;
 pub mod models;
+pub mod payout_reminders;
 pub mod payouts;
 pub mod prs;
 pub mod rate_limits;

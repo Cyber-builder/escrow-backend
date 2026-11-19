@@ -12,6 +12,9 @@ pub enum GithubError {
     Decode(String),
     #[error("GitHub App is not configured (see docs/GITHUB_APP.md)")]
     NotConfigured,
+    /// GitHub's primary or secondary limit is in force for this installation. Nothing was sent; retry after `retry_at`.
+    #[error("GitHub rate limit in force for {what}; retry after {retry_at}")]
+    RateLimited { retry_at: chrono::DateTime<chrono::Utc>, what: String },
 }
 
 impl GithubError {
@@ -20,9 +23,18 @@ impl GithubError {
         match self {
             Self::Status { status, .. } => *status >= 500 || *status == 429,
             Self::Network(_) => true,
+            Self::RateLimited { .. } => true,
             // configuration can be fixed while a job is still retrying
             Self::NotConfigured => true,
             _ => false,
+        }
+    }
+
+    /// When GitHub will accept calls for this installation again, if it said so.
+    pub fn retry_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Self::RateLimited { retry_at, .. } => Some(*retry_at),
+            _ => None,
         }
     }
 
@@ -63,6 +75,7 @@ mod tests {
             assert!(!GithubError::Status { status: s, what: "x".into() }.is_transient(), "{s}");
         }
         assert!(GithubError::Network("timeout".into()).is_transient());
+        assert!(GithubError::RateLimited { retry_at: chrono::Utc::now(), what: "x".into() }.is_transient());
         assert!(GithubError::NotConfigured.is_transient(), "jobs wait for the App to be configured instead of dying");
         assert!(!GithubError::Invalid("x".into()).is_transient());
     }
