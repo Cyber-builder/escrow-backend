@@ -10,7 +10,7 @@ use crate::{
     jobs as kinds,
     ops::{AlertInputs, AlertSender, collect_alerts},
     ports::ReviewRunner,
-    sync::{GithubCommenter, SyncDeps, announce_payout, refresh_bounty_card, send_refund_reminders, send_wallet_reminders},
+    sync::{GithubCommenter, SyncDeps, announce_payout, refresh_bounty_card, send_refund_reminders},
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use escrow_chain::{ChainReader, ReleaseSigner};
@@ -116,7 +116,11 @@ async fn run_one(w: &WorkerDeps, job: &Job, worker: usize) {
             }
         }
         Err(e) if e.is_transient() => {
-            let wait = retry_backoff_secs(job.attempts);
+            let mut wait = retry_backoff_secs(job.attempts);
+            // a rate limit names the time GitHub will accept calls again: never retry before it
+            if let Some(at) = e.retry_at() {
+                wait = wait.max((at - Utc::now()).num_seconds().max(1));
+            }
             tracing::warn!(worker, job = job.id, kind = %job.kind, attempt = job.attempts, error = %e, retry_in_secs = wait, "job failed, will retry");
             match jobs::fail(pool, job.id, &e.to_string(), wait).await {
                 Ok(true) => tracing::error!(job = job.id, kind = %job.kind, "job gave up after its last attempt"),
@@ -145,11 +149,6 @@ pub async fn run_periodic(w: Arc<WorkerDeps>, stop: CancellationToken) {
                     Ok(s) if !s.is_empty() => tracing::info!(sent = ?s, "refund reminders"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "reminders skipped"),
-                }
-                match send_wallet_reminders(&w.sync, w.grace, Utc::now()).await {
-                    Ok(s) if !s.is_empty() => tracing::info!(sent = ?s, "wallet reminders"),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "wallet reminders skipped"),
                 }
             }
             _ = alerts.tick() => {
