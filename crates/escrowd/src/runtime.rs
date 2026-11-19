@@ -188,6 +188,7 @@ impl Runtime {
             model_name: self.cfg.ai_model.clone(),
             max_per_pr_per_day: i64::from(self.cfg.ai_max_per_pr_per_day),
             max_per_repo_per_day: i64::from(self.cfg.ai_max_per_repo_per_day),
+            repo_context: self.cfg.ai_repo_context,
         })))
     }
 

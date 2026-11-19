@@ -1,7 +1,7 @@
 //! Reviewing one PR against its bounty and posting (or editing) the single review comment.
 
 use crate::{
-    input::{FileChange, ReviewInput},
+    input::{ContextFile, FileChange, ReviewInput, build_user_prompt, context_candidates},
     review::{Ci, ModelError, ModelPort, Rankable, diff_hash, rank_prs, render_review, review_pr, sanitize_review},
     schema::{Flag, Verdict},
 };
@@ -18,6 +18,8 @@ pub struct ReviewDeps {
     pub model_name: String,
     pub max_per_pr_per_day: i64,
     pub max_per_repo_per_day: i64,
+    /// read a few repository files for review context (`AI_REPO_CONTEXT=basic`)
+    pub repo_context: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -75,6 +77,28 @@ fn verdict_of(s: &str) -> Verdict {
     serde_json::from_value(serde_json::Value::String(s.to_string())).unwrap_or(Verdict::NeedsHuman)
 }
 
+/// Reads a few repository files for review context beyond the diff. A failed read stops the reading and keeps what
+/// was read, so a review never fails because context could not be fetched.
+async fn gather_context(d: &ReviewDeps, inst: i64, name: &str, head: &str, changes: &[FileChange]) -> Vec<ContextFile> {
+    if !d.repo_context {
+        return vec![];
+    }
+    let mut out = vec![];
+    for path in context_candidates(changes) {
+        // CONTRIBUTING.md comes from the default branch; changed files are read at the PR's head commit
+        let git_ref = if path == "CONTRIBUTING.md" { None } else { Some(head) };
+        match d.gh.get_file_at(inst, name, git_ref, &path).await {
+            Ok(Some(content)) => out.push(ContextFile { path, content }),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "review context read stopped; reviewing with what was read");
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Reviews one PR against the first live bounty it closes. Reviews are cached per commit, capped per PR and per
 /// repository per day (cost control), and a re-review edits the earlier comment instead of adding another.
 pub async fn run_pr_review(d: &ReviewDeps, now: DateTime<Utc>, pr_id: i64, force: bool) -> Result<ReviewOutcome, ReviewError> {
@@ -108,19 +132,18 @@ pub async fn run_pr_review(d: &ReviewDeps, now: DateTime<Utc>, pr_id: i64, force
         return Ok(ReviewOutcome::RateLimited);
     }
 
-    let (issue, files, ci, readme) = tokio::join!(
+    let (issue, files, ci) = tokio::join!(
         d.gh.get_issue(inst, name, bounty.issue_number),
         d.gh.get_pull_files(inst, name, pr.number),
         d.gh.get_ci_conclusion(inst, name, &sha),
-        d.gh.get_readme_excerpt(inst, name, 2000),
     );
     let (issue, files) = (issue?, files?);
     let ci = ci.unwrap_or(CiConclusion::None);
-    let _readme = readme.unwrap_or_default();
     let changes: Vec<FileChange> = files
         .into_iter()
         .map(|f| FileChange { path: f.filename, additions: f.additions, deletions: f.deletions, patch: f.patch })
         .collect();
+    let context = gather_context(d, inst, name, &sha, &changes).await;
 
     // signals computed by code, not by the model
     let hash = diff_hash(&changes);
@@ -132,25 +155,26 @@ pub async fn run_pr_review(d: &ReviewDeps, now: DateTime<Utc>, pr_id: i64, force
         extra.push(Flag::CiFailing);
     }
 
-    let out = review_pr(
-        d.model.as_ref(),
-        &ReviewInput {
-            issue_title: issue.title,
-            issue_body: issue.body.unwrap_or_default(),
-            criteria: bounty.criteria.clone(),
-            pr_title: live.title.clone(),
-            pr_body: live.body.clone().unwrap_or_default(),
-            files: changes,
-            ci: Some(ci_str(ci).to_string()),
-            language: None,
-        },
-    )
-    .await?;
+    let input = ReviewInput {
+        issue_title: issue.title,
+        issue_body: issue.body.unwrap_or_default(),
+        criteria: bounty.criteria.clone(),
+        pr_title: live.title.clone(),
+        pr_body: live.body.clone().unwrap_or_default(),
+        files: changes,
+        ci: Some(ci_str(ci).to_string()),
+        language: None,
+        context,
+    };
+    let report = build_user_prompt(&input).context;
+    let out = review_pr(d.model.as_ref(), &input).await?;
     let review = sanitize_review(out.review, &extra);
 
     // one comment per PR: edit the earlier one if we have it
     let previous = reviews::latest_commented(pool, pr_id).await?.and_then(|r| r.comment_id);
-    let result = serde_json::to_value(&review).expect("review serializes");
+    let mut result = serde_json::to_value(&review).expect("review serializes");
+    // record which context went in, so a maintainer can see what the reviewer could read
+    result["context"] = serde_json::json!({ "included": report.included, "omitted": report.omitted });
     let flags: Vec<String> = review.flags.iter().map(|f| f.as_str().to_string()).collect();
     let saved = reviews::upsert(
         pool,

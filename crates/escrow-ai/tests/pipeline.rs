@@ -72,6 +72,7 @@ async fn env(pool: PgPool) -> Env {
         model_name: "claude-test".into(),
         max_per_pr_per_day: 5,
         max_per_repo_per_day: 50,
+        repo_context: false,
     };
     Env { d, gh, model, pool }
 }
@@ -206,7 +207,7 @@ async fn env_with_second_pr(pool: &PgPool) -> Env {
     gh.set_pull(seed::REPO, 8, "zzz1234", "t", "b", false, "open", Utc::now());
     gh.set_files(seed::REPO, 8, files());
     Env {
-        d: ReviewDeps { db, gh: gh.clone(), model: model.clone(), model_name: "m".into(), max_per_pr_per_day: 5, max_per_repo_per_day: 50 },
+        d: ReviewDeps { db, gh: gh.clone(), model: model.clone(), model_name: "m".into(), max_per_pr_per_day: 5, max_per_repo_per_day: 50, repo_context: false },
         gh,
         model,
         pool: pool.clone(),

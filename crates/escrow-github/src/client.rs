@@ -29,6 +29,9 @@ const DEFAULT_PAUSE_SECS: i64 = 60;
 const ETAG_CACHE_MAX: usize = 1024;
 
 static LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^bounty: [A-Za-z0-9_ .]{1,40}$").unwrap());
+static FILE_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_./-]{1,300}$").unwrap());
+/// Files bigger than this are not read for review context.
+const MAX_CONTEXT_FILE_BYTES: u64 = 200_000;
 
 fn repo_ok(r: &str) -> Result<&str, GithubError> {
     let dots = r.split('/').any(|s| s == "." || s == "..");
@@ -473,6 +476,40 @@ impl GithubApi for GithubClient {
         let raw = j.content.unwrap_or_default().replace('\n', "");
         let bytes = STANDARD.decode(raw).unwrap_or_default();
         Ok(String::from_utf8_lossy(&bytes).chars().take(max_chars).collect())
+    }
+
+    async fn get_file_at(&self, installation: i64, repo: &str, git_ref: Option<&str>, path: &str) -> Result<Option<String>, GithubError> {
+        if !FILE_PATH.is_match(path) || path.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
+            return Err(GithubError::Invalid("invalid file path".into()));
+        }
+        let mut url = format!("/repos/{}/contents/{path}", repo_ok(repo)?);
+        if let Some(r) = git_ref {
+            if !SHA.is_match(r) {
+                return Err(GithubError::Invalid("invalid ref".into()));
+            }
+            url.push_str(&format!("?ref={r}"));
+        }
+        let r = self.call(installation, reqwest::Method::GET, &url, None).await?;
+        if r.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !r.status().is_success() {
+            return Err(GithubError::Status { status: r.status().as_u16(), what: "file read".into() });
+        }
+        #[derive(Deserialize)]
+        struct F {
+            #[serde(rename = "type")]
+            kind: Option<String>,
+            encoding: Option<String>,
+            size: Option<u64>,
+            content: Option<String>,
+        }
+        let f: F = r.json().await.map_err(|e| GithubError::Decode(e.to_string()))?;
+        if f.kind.as_deref() != Some("file") || f.encoding.as_deref() != Some("base64") || f.size.unwrap_or(0) > MAX_CONTEXT_FILE_BYTES {
+            return Ok(None);
+        }
+        let bytes = STANDARD.decode(f.content.unwrap_or_default().replace('\n', "")).unwrap_or_default();
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 
     async fn list_installations(&self) -> Result<Vec<InstallationInfo>, GithubError> {
