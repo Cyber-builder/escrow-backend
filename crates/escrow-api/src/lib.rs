@@ -50,7 +50,9 @@ fn client_ip(req: &Request, trust_proxy: bool) -> String {
 async fn edge(axum::extract::State(s): axum::extract::State<AppState>, mut req: Request, next: Next) -> Response {
     let ip = client_ip(&req, s.cfg.trust_proxy);
     Metrics::inc(&s.metrics.http_requests);
-    if req.uri().path() != "/health" && !s.limiter.check(&format!("g:{ip}"), GLOBAL_PER_MINUTE, Instant::now()) {
+    if req.uri().path() != "/health"
+        && !limiter::check_shared(&s.db.pool, &s.limiter, &format!("g:{ip}"), GLOBAL_PER_MINUTE, Instant::now()).await
+    {
         Metrics::inc(&s.metrics.http_rate_limited);
         return ApiError::rate_limited().into_response();
     }
