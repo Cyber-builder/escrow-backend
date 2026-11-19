@@ -10,7 +10,7 @@ use crate::{
     jobs as kinds,
     ops::{AlertInputs, AlertSender, collect_alerts},
     ports::ReviewRunner,
-    sync::{GithubCommenter, SyncDeps, announce_payout, refresh_bounty_card, send_refund_reminders},
+    sync::{GithubCommenter, SyncDeps, announce_payout, refresh_bounty_card, send_refund_reminders, send_wallet_reminders},
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use escrow_chain::{ChainReader, ReleaseSigner};
@@ -145,6 +145,11 @@ pub async fn run_periodic(w: Arc<WorkerDeps>, stop: CancellationToken) {
                     Ok(s) if !s.is_empty() => tracing::info!(sent = ?s, "refund reminders"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "reminders skipped"),
+                }
+                match send_wallet_reminders(&w.sync, w.grace, Utc::now()).await {
+                    Ok(s) if !s.is_empty() => tracing::info!(sent = ?s, "wallet reminders"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "wallet reminders skipped"),
                 }
             }
             _ = alerts.tick() => {
