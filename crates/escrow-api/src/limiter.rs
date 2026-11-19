@@ -1,7 +1,11 @@
-//! A small in-memory fixed-window rate limiter, keyed by user (when signed in) or IP.
-//! It is per process: fine for one API instance, and a deliberate trade for not running Redis.
-//! Run several instances behind a proxy and each enforces its own budget.
+//! A fixed-window rate limiter, keyed by user (when signed in) or IP.
+//!
+//! [`RateLimiter`] keeps its counters in this process. [`check_shared`] counts the same keys in Postgres, so
+//! every API instance draws from one budget. If the database is slow or unavailable, it falls back to the
+//! local limiter for that request: a database outage slows nothing down and never rejects all traffic.
 
+use escrow_db::rate_limits;
+use sqlx::PgPool;
 use std::{
     collections::HashMap,
     sync::Mutex,
@@ -14,10 +18,17 @@ pub struct RateLimiter {
 }
 
 const PRUNE_ABOVE: usize = 20_000;
+/// The longest a request waits for the shared store before using the local budget instead.
+const STORE_TIMEOUT: Duration = Duration::from_millis(200);
 
 impl RateLimiter {
     pub fn new(window: Duration) -> Self {
         Self { window, hits: Mutex::default() }
+    }
+
+    /// The window length in whole seconds (at least one), as the shared store counts it.
+    pub fn window_secs(&self) -> u32 {
+        self.window.as_secs().max(1) as u32
     }
 
     /// Counts one request for `key`; `false` once it exceeds `max` within the window.
@@ -37,6 +48,15 @@ impl RateLimiter {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.hits.lock().unwrap().len()
+    }
+}
+
+/// Counts one request for `key` against the budget shared by every instance (Postgres). Uses `local`
+/// instead when the shared store errors or does not answer within [`STORE_TIMEOUT`].
+pub async fn check_shared(pool: &PgPool, local: &RateLimiter, key: &str, max: u32, now: Instant) -> bool {
+    match tokio::time::timeout(STORE_TIMEOUT, rate_limits::hit(pool, key, i64::from(local.window_secs()))).await {
+        Ok(Ok(hits)) => i64::from(hits) <= i64::from(max),
+        _ => local.check(key, max, now),
     }
 }
 
@@ -63,6 +83,12 @@ mod tests {
         assert!(l.check("a", 1, t) && !l.check("a", 1, t));
         assert!(l.check("b", 1, t));
         assert!(l.check("c", 100, t));
+    }
+
+    #[test]
+    fn window_is_reported_in_whole_seconds() {
+        assert_eq!(RateLimiter::new(Duration::from_secs(60)).window_secs(), 60);
+        assert_eq!(RateLimiter::new(Duration::from_millis(10)).window_secs(), 1);
     }
 
     #[test]
